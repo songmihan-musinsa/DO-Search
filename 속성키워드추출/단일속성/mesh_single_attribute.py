@@ -95,8 +95,13 @@ class ProductData:
     title_text: str = ""                                     # 상품명 + 영문명 (브랜드 제거 후)
     detail_text: str = ""                                    # PDP 상세페이지 텍스트
     ocr_text: str = ""                                       # PDP 상세페이지 이미지 OCR 텍스트
-    attribute_map: dict = field(default_factory=dict)        # 매핑 결과 {속성: 값}
+    attribute_map: dict = field(default_factory=dict)        # 매핑 결과 {속성: 값} (우선순위 합산, 하위호환용)
     attribute_source_map: dict = field(default_factory=dict) # 매핑 출처 {속성: 'title'|'detail'|'ocr'}
+    # ── 소스 분리 매핑 결과 (정확도 비교용) ──
+    title_attribute_map: dict = field(default_factory=dict)   # 상품명에서 추출한 {속성: 값}
+    title_keyword_map: dict = field(default_factory=dict)     # 상품명에서 매칭된 {속성: 키워드}
+    detail_attribute_map: dict = field(default_factory=dict)  # PDP에서 추출한 {속성: 값}
+    detail_keyword_map: dict = field(default_factory=dict)    # PDP에서 매칭된 {속성: 키워드}
     # meta.data 원본 필드 (가능하면 채워집니다)
     brand: str = ""
     goods_nm_raw: str = ""
@@ -380,6 +385,61 @@ def map_attributes_by_source(title_text: str, detail_text: str, ocr_text: str, b
     return result
 
 
+def map_attributes_per_source(title_text: str, detail_text: str, ocr_text: str, brand: str = "") -> dict:
+    """소스별로 '독립적으로' 속성을 추출합니다 (우선순위로 하나만 고르지 않음).
+
+    상품명(title)과 PDP(detail)에서 각각 어떤 속성이 어떤 키워드로 매칭됐는지를
+    따로 비교할 수 있도록, 소스별 결과를 분리해서 반환합니다.
+
+    반환 형태:
+        {
+          "title":  {속성: {"value": 레이블, "keyword": 매칭키워드}, ...},
+          "detail": {속성: {"value": 레이블, "keyword": 매칭키워드}, ...},
+          "ocr":    {속성: {"value": 레이블, "keyword": 매칭키워드}, ...},
+        }
+    """
+    # 브랜드명은 title에서 토큰 제거 후 매칭 (오탐 방지)
+    title_clean = _remove_brand_tokens(title_text or "", brand)
+    sources = {
+        "title":  (title_clean or ""),
+        "detail": (detail_text or ""),
+        "ocr":    (ocr_text or ""),
+    }
+
+    result: dict[str, dict[str, dict[str, str]]] = {"title": {}, "detail": {}, "ocr": {}}
+
+    for src, text in sources.items():
+        if not text:
+            continue
+        text_lower = text.lower()
+        for attr, candidates in ATTRIBUTE_RULES.items():
+            allowed = ATTRIBUTE_ALLOWED_SOURCES.get(attr, ["detail", "ocr", "title"]) or ["detail", "ocr", "title"]
+            if src not in allowed:
+                continue
+            matched_label = None
+            matched_kw = None
+            for label, keywords in candidates.items():
+                if label == "기타":
+                    continue
+                for kw in keywords:
+                    if not kw:
+                        continue
+                    kw_lc = kw.lower()
+                    if kw_lc in text_lower:
+                        # 영문 'mesh'는 문맥 검사
+                        if kw_lc == "mesh" and not _is_mesh_accepted(kw_lc, src, text_lower):
+                            continue
+                        matched_label = label
+                        matched_kw = kw
+                        break
+                if matched_label:
+                    break
+            if matched_label:
+                result[src][attr] = {"value": matched_label, "keyword": matched_kw}
+
+    return result
+
+
 def legacy_map_attributes(text: str) -> dict[str, str]:
     """Legacy single-text mapping (pre-separation).
 
@@ -616,6 +676,18 @@ def collect_product(goods_no: str | int) -> ProductData:
     product.attribute_map = {k: v["value"] for k, v in mapped.items()}
     product.attribute_source_map = {k: v["source"] for k, v in mapped.items()}
 
+    # ── STEP 6: 소스별 독립 매핑 (상품명 vs PDP 정확도 비교용) ──
+    per_source = map_attributes_per_source(
+        title_text=product.title_text,
+        detail_text=product.detail_text,
+        ocr_text=product.ocr_text,
+        brand=product.brand,
+    )
+    product.title_attribute_map = {k: v["value"] for k, v in per_source["title"].items()}
+    product.title_keyword_map   = {k: v["keyword"] for k, v in per_source["title"].items()}
+    product.detail_attribute_map = {k: v["value"] for k, v in per_source["detail"].items()}
+    product.detail_keyword_map   = {k: v["keyword"] for k, v in per_source["detail"].items()}
+
     return product
 
 
@@ -640,10 +712,17 @@ def print_product_summary(p: ProductData) -> None:
         else:
             print(f"  [{i}] IMAGE : {block.content}")
 
-    print(f"\n[속성 매핑 결과]")
-    for attr, val in p.attribute_map.items():
-        src = p.attribute_source_map.get(attr, "")
-        print(f"  {attr:12s} : {val}  (출처: {src})")
+    print(f"\n[속성 매핑 결과 — 소스 분리 (상품명 vs PDP)]")
+    all_attrs = list(ATTRIBUTE_RULES.keys())
+    print(f"  {'속성':12s} | {'상품명 추출':28s} | {'PDP 추출':28s}")
+    for attr in all_attrs:
+        t_val = p.title_attribute_map.get(attr, "")
+        t_kw  = p.title_keyword_map.get(attr, "")
+        d_val = p.detail_attribute_map.get(attr, "")
+        d_kw  = p.detail_keyword_map.get(attr, "")
+        t_cell = f"{t_val} ({t_kw})" if t_val else "-"
+        d_cell = f"{d_val} ({d_kw})" if d_val else "-"
+        print(f"  {attr:12s} | {t_cell:28s} | {d_cell:28s}")
 
     # 추가 원본 필드 출력
     print(f"브랜드      : {p.brand}")
@@ -706,6 +785,10 @@ if __name__ == "__main__":
             "notification_info": p.notification_info,
             "detail_blocks":   [{"type": b.type, "content": b.content} for b in p.detail_blocks],
             "attribute_map":   p.attribute_map,
+            "title_attribute_map":  p.title_attribute_map,
+            "title_keyword_map":    p.title_keyword_map,
+            "detail_attribute_map": p.detail_attribute_map,
+            "detail_keyword_map":   p.detail_keyword_map,
         })
 
     out_path = "musinsa_collected.json"
@@ -905,29 +988,37 @@ if __name__ == "__main__":
             print(f"\n--- 수집 & 매핑 테스트: goods_no={gno} ---")
             try:
                 p = collect_product(gno)
-                # `attribute_map` 출력
-                print("매핑 결과:")
-                for k, v in p.attribute_map.items():
-                    print(f"  {k:12} : {v}")
-                # 결과에 브랜드와 원상품명을 추가
-                results.append({
+                # 소스 분리 매핑 결과 출력
+                print("매핑 결과 (상품명 | PDP):")
+                for attr in ATTRIBUTE_RULES.keys():
+                    t = p.title_attribute_map.get(attr, "")
+                    tk = p.title_keyword_map.get(attr, "")
+                    d = p.detail_attribute_map.get(attr, "")
+                    dk = p.detail_keyword_map.get(attr, "")
+                    print(f"  {attr:12} : 상품명={t}({tk}) | PDP={d}({dk})")
+
+                # 결과 행 구성: 속성별로 상품명/ PDP 추출을 분리한 컬럼 생성
+                row = {
                     "goods_no": gno,
                     "brand": getattr(p, "brand", ""),
                     "goods_nm": getattr(p, "goods_nm_raw", p.goods_nm),
-                    "attribute_map": p.attribute_map,
-                })
+                }
+                for attr in ATTRIBUTE_RULES.keys():
+                    t = p.title_attribute_map.get(attr, "")
+                    tk = p.title_keyword_map.get(attr, "")
+                    d = p.detail_attribute_map.get(attr, "")
+                    dk = p.detail_keyword_map.get(attr, "")
+                    # 값 + 매칭된 키워드를 함께 기록 (정확도 비교용)
+                    row[f"{attr}_상품명"] = f"{t} ({tk})" if t else ""
+                    row[f"{attr}_PDP"] = f"{d} ({dk})" if d else ""
+                results.append(row)
             except Exception as ex:
                 print(f"상품 {gno} 처리 중 오류: {ex}")
 
         # 성공한 항목이 있으면 시트에 저장
         if results:
-            # flatten attribute_map into columns
-            df_res = pd.json_normalize(results)
-            if "attribute_map" in df_res.columns:
-                attr_df = pd.json_normalize(df_res["attribute_map"]) 
-                df_final = pd.concat([df_res.drop(columns=["attribute_map"]), attr_df], axis=1)
-            else:
-                df_final = df_res
+            # results는 이미 평탄화된 행 (속성별 상품명/PDP 컬럼 포함)
+            df_final = pd.DataFrame(results)
 
             # 브랜드, 상품명 컬럼 추가 및 정렬
             if "brand" not in df_final.columns:
@@ -951,8 +1042,6 @@ if __name__ == "__main__":
         print("\n테스트 완료")
     except Exception as e:
         print("테스트 실패:", e)
-
-
 
 
 
