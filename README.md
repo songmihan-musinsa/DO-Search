@@ -1,2 +1,3 @@
 # DO-Search
-DO - Discovery Product 
+DATA OPERATION - Discovery Product 팀 코드 저장소
+
