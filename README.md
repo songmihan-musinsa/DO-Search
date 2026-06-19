@@ -1,3 +1,3 @@
 # DO-Search
-DATA OPERATION - Discovery Product 팀 코드 저장소
+Discovery Product 속성레이블링 자동화 코드
 
